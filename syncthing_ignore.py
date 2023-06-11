@@ -142,6 +142,10 @@ def prepend_pattern(pattern: str, dir: str) -> str:
     return result.match + os.path.join(dir, result.rest)
 
 
+def ensure_endln(line: str):
+    return line + "\n" if not line.endswith("\n") else line
+
+
 def write_from_ignores(ignores_root: Path, folder_ignore: IO[str], default: IO[str]):
     for file in ignores_root.iterdir():
         if not file.is_file():
@@ -149,11 +153,11 @@ def write_from_ignores(ignores_root: Path, folder_ignore: IO[str], default: IO[s
         name = file.name
         with file.open() as file_contents:
             folder_ignore.write(f"// Entries from {name!r}\n\n")
-            for line in file_contents:
+            for line in map(ensure_endln, file_contents):
                 folder_ignore.write(prepend_pattern(line, f"/{name}"))
 
     folder_ignore.write(f"// Default entries\n\n")
-    folder_ignore.writelines(default)
+    folder_ignore.writelines(map(ensure_endln, default))
 
 
 @app.command()
