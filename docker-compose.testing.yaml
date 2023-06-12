@@ -1,0 +1,33 @@
+services:
+  ignore-merger:
+    image: fakuivan/syncthing-ignore-merger:latest
+    build: .
+    command:
+      - monitor
+      - /ignores/
+      - /folder_ignore/.stignore
+      - /default_ignore/.stignore
+      - --timeout
+      - "1"
+    volumes:
+      - /tmp/ignores_test/ignores/:/ignores:ro
+      - /tmp/ignores_test/folder_ignore:/folder_ignore
+      - /tmp/ignores_test/default:/default_ignore:ro
+
+  ignore-gen:
+    image: alpine
+    depends_on:
+      - ignore-merger
+    volumes:
+      - /tmp/ignores_test/ignores/:/ignores
+      - /tmp/ignores_test/folder_ignore:/folder_ignore:ro
+      - /tmp/ignores_test/default:/default_ignore
+    command:
+      - sh
+      - -c
+      - |
+        printf "%s" "**" > /default_ignore/.stignore
+        printf "%s" "!**" > /ignores/subdir1
+        printf "%s\n" "!my_config" "!my_config1" > /ignores/subdir2
+        sleep 3
+        cat /folder_ignore/.stignore
