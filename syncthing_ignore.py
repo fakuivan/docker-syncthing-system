@@ -1,6 +1,17 @@
 #!/usr/bin/env python3.10
 import os
-from typing import NamedTuple, Callable, TypeVar, Iterable, Iterator, IO, Any
+from typing import (
+    NamedTuple,
+    Callable,
+    TypeVar,
+    Iterable,
+    Iterator,
+    IO,
+    Any,
+    ContextManager,
+    ParamSpec,
+    Generator,
+)
 import typer
 import tempfile
 from contextlib import contextmanager
@@ -8,18 +19,45 @@ from pathlib import Path
 import inotify.adapters
 import inotify.constants
 from concurrent.futures import wait, ThreadPoolExecutor, Future
-from threading import Lock, Condition
+from threading import Lock, Condition, Event
 from time import time
+from functools import wraps
+import shutil
+
+
+T = TypeVar("T")
+C = TypeVar("C", bound=ContextManager)
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def move_on_close(file: IO[str], dest: Path):
+    return on_exit(
+        file,
+        lambda e: shutil.move(file.name, dest) if e is None else os.remove(file.name),
+    )
 
 
 @contextmanager
-def move_on_close(file: IO[str], dest: Path):
+def on_exit(
+    manager: C, func: Callable[[BaseException | None], None]
+) -> Generator[C, None, None]:
     try:
-        with file:
-            yield file
-        os.replace(file.name, dest)
-    except:
-        os.remove(file.name)
+        with manager:
+            yield manager
+        func(None)
+    except BaseException as e:
+        func(e)
+        raise e
+
+
+@contextmanager
+def before_exit(manager: C, func: Callable[[C], None]):
+    with manager:
+        try:
+            yield manager
+        finally:
+            func(manager)
 
 
 class ConsumeResult(NamedTuple):
@@ -38,9 +76,6 @@ class ConsumeResult(NamedTuple):
     def from_prefix(cls, input: str, prefix: str):
         if input.startswith(prefix):
             return ConsumeResult(prefix, input[len(prefix) :])
-
-
-T = TypeVar("T")
 
 
 def skip(index: int, elements: Iterable[T]) -> Iterator[T]:
@@ -66,11 +101,26 @@ def future_raise(future: Future[Any]):
         raise e
 
 
-T = TypeVar("T")
+def exceptions_suck_ass(func: Callable[P, R]) -> Callable[P, R]:
+    @wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs):
+        try:
+            return func(*args, **kwargs)
+        except KeyboardInterrupt as e:
+            raise typer.Abort from e
+
+    return wrapper
+
+
+def break_when(should_stop: Event, iter: Iterable[T]) -> Iterator[T]:
+    for item in iter:
+        yield item
+        if should_stop.is_set():
+            break
 
 
 def debounce(
-    iter: Iterable[T], timeout: float, max_queue_size: int = 1024
+    iter: Callable[[Event], Iterable[T]], timeout: float, max_queue_size: int = 1024
 ) -> Iterator[list[T]]:
     """
     Yields lists of elements from `iter` where the time taken to yield
@@ -93,10 +143,11 @@ def debounce(
     last_time: float = time()
     lock = Lock()
     queue_cleared = Condition()
+    stop_runnning_event = Event()
 
     def get_elements():
         nonlocal last_time
-        for elem in iter:
+        for elem in break_when(stop_runnning_event, iter(stop_runnning_event)):
             with lock:
                 size_good = len(queue) < max_queue_size
             if not size_good:
@@ -106,7 +157,9 @@ def debounce(
                 last_time = time()
                 queue.append(elem)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    with before_exit(
+        ThreadPoolExecutor(max_workers=1), lambda _: stop_runnning_event.set()
+    ) as executor:
         get_elements_fut = executor.submit(get_elements)
         while True:
             with lock:
@@ -161,17 +214,19 @@ def write_from_ignores(ignores_root: Path, folder_ignore: IO[str], default: IO[s
 
 
 @app.command()
+@exceptions_suck_ass
 def monitor(
     ignores_root: Path,
     folder_ignore: Path,
     default: typer.FileText,
     timeout: float = 5.0,
 ):
-    def receive_events():
+    def receive_events(should_stop: Event):
         i = inotify.adapters.Inotify()
         i.add_watch(f"{ignores_root}", inotify.constants.IN_CLOSE_WRITE)
-        for e in i.event_gen(yield_nones=False):
-            assert e is not None
+        for e in break_when(should_stop, i.event_gen(yield_nones=True)):
+            if e is None:
+                continue
             (_, _, _, filename) = e
             typer.echo(
                 f"Received event close after write for file {filename!r} on ignores directory, waiting to group events"
@@ -180,7 +235,7 @@ def monitor(
 
     typer.echo("Waiting for events")
     # `debounce` groups events that happen within `timeout` of each other
-    for events in debounce(receive_events(), timeout):
+    for events in debounce(receive_events, timeout):
         typer.echo(f"Pooled {len(events)} event(s), updating ignores directory")
         with move_on_close(
             tempfile.NamedTemporaryFile("w", delete=False), folder_ignore
