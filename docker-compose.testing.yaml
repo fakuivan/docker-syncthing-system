@@ -3,10 +3,10 @@ services:
     image: fakuivan/syncthing-ignore-merger:latest
     build: .
     command:
-      - monitor
       - /ignores/
       - /folder_ignore/.stignore
       - /default_ignore/.stignore
+      - monitor
       - --timeout
       - "1"
     volumes:

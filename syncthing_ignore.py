@@ -11,6 +11,8 @@ from typing import (
     ContextManager,
     ParamSpec,
     Generator,
+    NamedTuple,
+    Annotated
 )
 import typer
 import tempfile
@@ -20,9 +22,13 @@ import inotify.adapters
 import inotify.constants
 from concurrent.futures import wait, ThreadPoolExecutor, Future
 from threading import Lock, Condition, Event
-from time import time
+import time
 from functools import wraps
 import shutil
+import filecmp
+import datetime
+import croniter
+from itertools import chain
 
 
 T = TypeVar("T")
@@ -31,16 +37,24 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def move_on_close(file: IO[str], dest: Path):
+def move_on_close(file: IO[str], dest: Path, on_file_changed: Callable[[], Any] = lambda: None):
+    def move_file(e):
+        if e is not None:
+            os.remove(file.name)
+        if os.path.exists(dest) and filecmp.cmp(file.name, dest):
+            return
+        shutil.move(file.name, dest)
+        on_file_changed()
+
     return on_exit(
         file,
-        lambda e: shutil.move(file.name, dest) if e is None else os.remove(file.name),
+        move_file,
     )
 
 
 @contextmanager
 def on_exit(
-    manager: C, func: Callable[[BaseException | None], None]
+    manager: C, func: Callable[[BaseException | None], Any]
 ) -> Generator[C, None, None]:
     try:
         with manager:
@@ -140,7 +154,7 @@ def debounce(
     ```
     """
     queue: list[T] = []
-    last_time: float = time()
+    last_time: float = time.time()
     lock = Lock()
     queue_cleared = Condition()
     stop_runnning_event = Event()
@@ -154,7 +168,7 @@ def debounce(
                 with queue_cleared:
                     queue_cleared.wait()
             with lock:
-                last_time = time()
+                last_time = time.time()
                 queue.append(elem)
 
     with before_exit(
@@ -163,7 +177,7 @@ def debounce(
         get_elements_fut = executor.submit(get_elements)
         while True:
             with lock:
-                wait_for = last_time + timeout - time()
+                wait_for = last_time + timeout - time.time()
             if wait_for < 0:
                 wait_for = timeout
                 if len(queue) > 0:
@@ -210,20 +224,82 @@ def write_from_ignores(ignores_root: Path, folder_ignore: IO[str], default: IO[s
                 folder_ignore.write(prepend_pattern(line, f"/{name}"))
 
     folder_ignore.write(f"// Default entries\n\n")
-    folder_ignore.writelines(map(ensure_endln, default))
+    folder_ignore.writelines(default)
+
+
+class BaseArgs(NamedTuple):
+    ignores_root: Path
+    folder_ignore: Path
+    base_ignore: Path
+
+
+@app.callback()
+def base_params(
+    ctx: typer.Context,
+    ignores_root: Path = typer.Argument(
+        ..., help="Path to the root ignore file for folder"
+    ),
+    folder_ignore: Path = typer.Argument(
+        ..., help="Path to the subdirectory ignore files"
+    ),
+    base_ignore: Path = typer.Argument(..., help="Path to the base ignore file"),
+):
+    ctx.obj = BaseArgs(ignores_root, folder_ignore, base_ignore)
+
+
+def merge_ignores(params: BaseArgs):
+    changed = False
+    def set_changed():
+        nonlocal changed
+        changed = True
+    with move_on_close(
+        tempfile.NamedTemporaryFile("w", delete=False), params.folder_ignore, set_changed
+    ) as temp_file, open(params.base_ignore) as default:
+        write_from_ignores(params.ignores_root, temp_file, default)
+    return changed
+
+
+def follow_crontab(
+    crontab: croniter.croniter,
+) -> Iterator[tuple[datetime.datetime, datetime.timedelta | None]]:
+    delta = None
+    while True:
+        next_run: datetime.datetime = crontab.get_next(datetime.datetime)
+        yield next_run, delta
+        now = next_run.now(next_run.tzinfo)
+        delta = next_run - now
+        time.sleep(delta.total_seconds())
+
+
+def validate_crontab(value: str) -> str:
+    if not croniter.croniter.is_valid(value):
+        raise typer.BadParameter("Invalid crontab format")
+    return value
+
+
+@app.command()
+def timed(
+    ctx: typer.Context,
+    crontab: Annotated[str, typer.Argument(..., callback=validate_crontab)],
+    now: bool = True
+):
+    params: BaseArgs = ctx.obj
+    it = follow_crontab(croniter.croniter(crontab))
+    if not now:
+        next(it)
+    for _ in it:
+        if merge_ignores(params):
+            typer.echo("Updated ignores file")
 
 
 @app.command()
 @exceptions_suck_ass
-def monitor(
-    ignores_root: Path,
-    folder_ignore: Path,
-    default: typer.FileText,
-    timeout: float = 5.0,
-):
+def monitor(ctx: typer.Context, timeout: float = 5.0):
+    params: BaseArgs = ctx.obj
+
     def receive_events(should_stop: Event):
         i = inotify.adapters.Inotify()
-        i.add_watch(f"{ignores_root}", inotify.constants.IN_CLOSE_WRITE)
+        i.add_watch(f"{params.ignores_root}", inotify.constants.IN_CLOSE_WRITE)
         for e in break_when(should_stop, i.event_gen(yield_nones=True)):
             if e is None:
                 continue
@@ -237,10 +313,7 @@ def monitor(
     # `debounce` groups events that happen within `timeout` of each other
     for events in debounce(receive_events, timeout):
         typer.echo(f"Pooled {len(events)} event(s), updating ignores directory")
-        with move_on_close(
-            tempfile.NamedTemporaryFile("w", delete=False), folder_ignore
-        ) as temp_file:
-            write_from_ignores(ignores_root, temp_file, default)
+        merge_ignores(params)
 
 
 @app.command()
