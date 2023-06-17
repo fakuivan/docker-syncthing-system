@@ -26,8 +26,8 @@ services:
       - sh
       - -c
       - |
-        printf "%s" "**" > /default_ignore/.stignore
-        printf "%s" "!**" > /ignores/subdir1
-        printf "%s\n" "!my_config" "!my_config1" > /ignores/subdir2
+        printf "%s\n" "**" > /default_ignore/.stignore
+        printf "%s\n" "!**" > /ignores/subdir1
+        printf "%s\n" "!my_config" "!/my_config1" > /ignores/subdir2
         sleep 3
         cat /folder_ignore/.stignore
