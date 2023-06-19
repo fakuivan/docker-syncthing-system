@@ -3,34 +3,34 @@ services:
     image: fakuivan/syncthing-ignore-merger:latest
     build: .
     command:
-      - from-dir
+      - from-docker-labels
       - /folder_ignore/.stignore
       - /default_ignore/.stignore
-      - /ignores/
-      - monitor
-      - --timeout
-      - "1"
+      - /tmp/ignores_test/folder/
+      - io.github.fakuivan.stmerger.stignore
+      - io.github.fakuivan.stmerger.subdir
     volumes:
       - /tmp/ignores_test/ignores/:/ignores:ro
       - /tmp/ignores_test/folder_ignore:/folder_ignore
       - /tmp/ignores_test/default:/default_ignore:ro
-    labels:
-      com.centurylinklabs.watchtower.enable: true
+      - /var/run/docker.sock:/var/run/docker.sock
 
-  ignore-gen:
+  auto_name:
     image: alpine
     depends_on:
       - ignore-merger
     volumes:
-      - /tmp/ignores_test/ignores/:/ignores
+      - /tmp/ignores_test/folder/auto_name:/synched:rw
       - /tmp/ignores_test/folder_ignore:/folder_ignore:ro
-      - /tmp/ignores_test/default:/default_ignore
-    command:
+    labels:
+      io.github.fakuivan.stmerger.stignore: |
+        /dir1
+        /dir2
+        dir3
+        a_file.*
+    command: 
       - sh
       - -c
       - |
-        printf "%s\n" "**" > /default_ignore/.stignore
-        printf "%s\n" "!**" > /ignores/subdir1
-        printf "%s\n" "!my_config" "!/my_config1" > /ignores/subdir2
         sleep 3
         cat /folder_ignore/.stignore

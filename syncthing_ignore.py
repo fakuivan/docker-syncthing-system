@@ -12,7 +12,8 @@ from typing import (
     ParamSpec,
     Generator,
     NamedTuple,
-    Annotated
+    Annotated,
+    TypeAlias,
 )
 import typer
 import tempfile
@@ -28,7 +29,8 @@ import shutil
 import filecmp
 import datetime
 import croniter
-from itertools import chain
+import docker
+from returns.result import Result, Success, Failure
 
 
 T = TypeVar("T")
@@ -37,7 +39,9 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def move_on_close(file: IO[str], dest: Path, on_file_changed: Callable[[], Any] = lambda: None):
+def move_on_close(
+    file: IO[str], dest: Path, on_file_changed: Callable[[], Any] = lambda: None
+):
     def move_file(e):
         if e is not None:
             os.remove(file.name)
@@ -107,23 +111,14 @@ def consume(input: str, *prefixes: str) -> ConsumeResult:
 
 
 app = typer.Typer()
+from_dir = typer.Typer()
+app.add_typer(from_dir, name="from-dir")
 
 
 def future_raise(future: Future[Any]):
     e = future.exception()
     if e is not None:
         raise e
-
-
-def exceptions_suck_ass(func: Callable[P, R]) -> Callable[P, R]:
-    @wraps(func)
-    def wrapper(*args: P.args, **kwargs: P.kwargs):
-        try:
-            return func(*args, **kwargs)
-        except KeyboardInterrupt as e:
-            raise typer.Abort from e
-
-    return wrapper
 
 
 def break_when(should_stop: Event, iter: Iterable[T]) -> Iterator[T]:
@@ -214,46 +209,62 @@ def ensure_endln(line: str):
 
 
 def write_from_ignores(ignores_root: Path, folder_ignore: IO[str], default: IO[str]):
-    for file in ignores_root.iterdir():
-        if not file.is_file():
-            continue
-        name = file.name
-        with file.open() as file_contents:
-            folder_ignore.write(f"// Entries from {name!r}\n\n")
-            for line in map(ensure_endln, file_contents):
-                folder_ignore.write(prepend_pattern(line, f"/{name}"))
+    def ignores():
+        for file in ignores_root.iterdir():
+            if not file.is_file():
+                continue
+            name = file.name
+            with file.open() as file_contents:
+                yield name, file_contents
+
+    write_stignore(ignores(), folder_ignore, default)
+
+
+def write_stignore(
+    ignores: Iterable[tuple[str, Iterable[str]]],
+    folder_ignore: IO[str],
+    default: IO[str],
+):
+    for name, contents in ignores:
+        folder_ignore.write(f"// Entries from {name!r}\n\n")
+        for line in map(ensure_endln, contents):
+            folder_ignore.write(prepend_pattern(line, f"/{name}"))
 
     folder_ignore.write(f"// Default entries\n\n")
     folder_ignore.writelines(default)
 
 
-class BaseArgs(NamedTuple):
-    ignores_root: Path
+class IgnoresDirArgs(NamedTuple):
     folder_ignore: Path
     base_ignore: Path
+    ignores_root: Path
 
 
-@app.callback()
-def base_params(
+@from_dir.callback()
+def ignores_dir(
     ctx: typer.Context,
-    ignores_root: Path = typer.Argument(
-        ..., help="Path to the root ignore file for folder"
-    ),
     folder_ignore: Path = typer.Argument(
         ..., help="Path to the subdirectory ignore files"
     ),
     base_ignore: Path = typer.Argument(..., help="Path to the base ignore file"),
+    ignores_root: Path = typer.Argument(
+        ..., help="Path to the root ignore file for folder"
+    ),
 ):
-    ctx.obj = BaseArgs(ignores_root, folder_ignore, base_ignore)
+    ctx.obj = IgnoresDirArgs(folder_ignore, base_ignore, ignores_root)
 
 
-def merge_ignores(params: BaseArgs):
+def merge_ignores(params: IgnoresDirArgs):
     changed = False
+
     def set_changed():
         nonlocal changed
         changed = True
+
     with move_on_close(
-        tempfile.NamedTemporaryFile("w", delete=False), params.folder_ignore, set_changed
+        tempfile.NamedTemporaryFile("w", delete=False),
+        params.folder_ignore,
+        set_changed,
     ) as temp_file, open(params.base_ignore) as default:
         write_from_ignores(params.ignores_root, temp_file, default)
     return changed
@@ -277,13 +288,13 @@ def validate_crontab(value: str) -> str:
     return value
 
 
-@app.command()
+@from_dir.command()
 def timed(
     ctx: typer.Context,
     crontab: Annotated[str, typer.Argument(..., callback=validate_crontab)],
-    now: bool = True
+    now: bool = True,
 ):
-    params: BaseArgs = ctx.obj
+    params: IgnoresDirArgs = ctx.obj
     it = follow_crontab(croniter.croniter(crontab))
     if not now:
         next(it)
@@ -292,10 +303,9 @@ def timed(
             typer.echo("Updated ignores file")
 
 
-@app.command()
-@exceptions_suck_ass
+@from_dir.command()
 def monitor(ctx: typer.Context, timeout: float = 5.0):
-    params: BaseArgs = ctx.obj
+    params: IgnoresDirArgs = ctx.obj
 
     def receive_events(should_stop: Event):
         i = inotify.adapters.Inotify()
@@ -316,7 +326,7 @@ def monitor(ctx: typer.Context, timeout: float = 5.0):
         merge_ignores(params)
 
 
-@app.command()
+@from_dir.command()
 def oneshot(ignores_root: Path, folder_ignore: Path, default: typer.FileText):
     with move_on_close(
         tempfile.NamedTemporaryFile("w", delete=False), folder_ignore
@@ -324,9 +334,132 @@ def oneshot(ignores_root: Path, folder_ignore: Path, default: typer.FileText):
         write_from_ignores(ignores_root, temp_file, default)
 
 
+def guess_name_from_mounts(mounts, folder_root: Path) -> set[str]:
+    sources = (Path(mount["Source"]) for mount in mounts)
+    subdir_matches = (
+        source.relative_to(folder_root)
+        for source in sources
+        if source.is_relative_to(folder_root)
+    )
+    name_candidates = set(match.parts[0] for match in subdir_matches)
+    return name_candidates
+
+
+BadAPIValue = dict[str, "str | BadAPIValue"]
+ContainerID: TypeAlias = str
+IgnoreContents: TypeAlias = str
+IgnoreSubdirName: TypeAlias = str
+
+
 @app.command()
-def single_file(new_root: str, input: typer.FileText, out: typer.FileTextWrite):
-    out.writelines(prepend_pattern(pattern, new_root) for pattern in input)
+def from_docker_labels(
+    folder_ignore: Path,
+    default_ignore: Path,
+    host_folder_root: Path,
+    stignore_contents_label: str,
+    subdir_name_label: str,
+):
+    client = docker.from_env()
+    ignores: dict[IgnoreSubdirName, IgnoreContents] = {}
+    owners: dict[IgnoreSubdirName, ContainerID] = {}
+
+    def add_container(
+        container_id: ContainerID, labels, get_mounts: Callable[[], Any]
+    ) -> Result[None | str, str]:
+        name: IgnoreSubdirName
+        if stignore_contents_label not in labels:
+            return Success(None)
+        contents = labels[stignore_contents_label]
+        if subdir_name_label in labels:
+            name = labels[subdir_name_label]
+        else:
+            guesses = guess_name_from_mounts(get_mounts(), host_folder_root)
+            if len(guesses) != 1:
+                return Failure(
+                    "Failed to determine a single subdirectory based "
+                    f"on mounts, guesses for subdirectory were {guesses!r}"
+                )
+            (name,) = guesses
+
+        if name in owners:
+            return Failure(
+                f"Subdirectory name {name!r} in use by container ({owners[name]})"
+            )
+        owners[name] = container_id
+        ignores[name] = contents
+        return Success(name)
+
+    def remove_container(container_id: ContainerID) -> IgnoreSubdirName | None:
+        if container_id not in owners.values():
+            return None
+        for name, id in owners.items():
+            if id == container_id:
+                ignores.pop(name)
+                owners.pop(name)
+                return name
+
+    def write_ignore_file():
+        with (
+            open(default_ignore) as fd_default_ignore,
+            open(folder_ignore, "w") as fd_folder_ignore,
+        ):
+            write_stignore(
+                ((name, contents.splitlines()) for name, contents in ignores.items()),
+                fd_folder_ignore,
+                fd_default_ignore,
+            )
+
+    typer.echo("Initializing based on existing containers")
+
+    for container in client.api.containers(all=True):
+        container_id: ContainerID = container["Id"]
+        container_name: str = container["Names"][0]
+        match add_container(
+            container_id, container["Labels"], lambda: container["Mounts"]
+        ):
+            case Failure(reason):
+                typer.echo(
+                    f"Failure to process container {container_name!r} ({container_id}): {reason}"
+                )
+            case Success(str(name)):
+                typer.echo(
+                    f"Updating stignore contents for {container_name!r} ({container_id}) using subdir {name}"
+                )
+    write_ignore_file()
+
+    typer.echo("Listening for container started events")
+
+    for event in client.api.events(
+        decode=True, filters=dict(type="container", event=["create", "destroy"])
+    ):
+        container_id: ContainerID = event["id"]
+        attrs = event["Actor"]["Attributes"]
+        container_name = attrs["name"]
+        if event["Action"] == "destroy":
+            name = remove_container(container_id)
+            if name is None:
+                continue
+            typer.echo(
+                f"Container {container_name!r} ({container_id}) using "
+                f"subdir {name} removed, updating stignore contents"
+            )
+            write_ignore_file()
+            continue
+
+        match add_container(
+            container_id,
+            attrs,
+            lambda: client.api.inspect_container(container_id)["Mounts"],
+        ):
+            case Failure(reason):
+                typer.echo(
+                    f"Failed to process container {container_name!r} ({container_id}): {reason}"
+                )
+            case Success(str(name)):
+                typer.echo(
+                    f"Updating stignore contents for {container_name!r} ({container_id}) using subdir {name}"
+                )
+        write_ignore_file()
 
 
 if __name__ == "__main__":
